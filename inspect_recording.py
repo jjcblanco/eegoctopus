@@ -70,7 +70,7 @@ def plot_recording(npz_path, out_path, detrend):
         fontsize=10, color=AXIS_INK, x=0.03, ha="left",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.985))
-    fig.savefig(out_path, dpi=150, facecolor=BG)
+    fig.savefig(out_path, dpi=150, facecolor=BG, transparent=False)
     plt.close(fig)
     print(f"Saved plot to {out_path}")
 
