@@ -19,10 +19,11 @@ MAX_SAMPLES = SAMPLING_RATE * WINDOW_DURATION
 
 def parse_channel_frame(message):
     """
-    Extract one EEG sample from a PiEEG JSON message.
+    Extract one EEG sample and its server timestamp from a PiEEG JSON message.
 
-    The expected message is {"channels": [value, ...]}. Other message types
-    are ignored so status/heartbeat messages do not enter the training data.
+    The expected data message is {"t": ..., "n": ..., "channels": [value, ...]}.
+    Other message types are ignored so status/heartbeat messages do not enter
+    the training data.
     """
     if "channels" not in message:
         return None
@@ -32,7 +33,7 @@ def parse_channel_frame(message):
         return None
     if not np.all(np.isfinite(values)):
         return None
-    return values
+    return values, message.get("t")
 
 
 def process_live_window(window_matrix):
@@ -43,24 +44,32 @@ def process_live_window(window_matrix):
     )
 
 
-def save_recording(samples, output_path, label, brain_region, sample_rate):
+def save_recording(samples, timestamps, output_path, label, brain_region, sample_rate):
     """Save a recording and enough metadata to reproduce its preprocessing."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_rate = sample_rate
+    if timestamps is not None and len(timestamps) > 1:
+        span = timestamps[-1] - timestamps[0]
+        if span > 0:
+            effective_rate = (len(timestamps) - 1) / span
     metadata = {
         "label": label,
         "brain_region": brain_region,
         "channels": N_CHANNELS,
         "sample_rate_hz": sample_rate,
+        "effective_sample_rate_hz": round(float(effective_rate), 2),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source": "PiEEG WebSocket",
     }
     np.savez_compressed(
         output_path,
         eeg=samples,
+        timestamps=np.asarray(timestamps) if timestamps is not None else np.asarray([]),
         label=np.asarray(label),
         metadata=np.asarray(json.dumps(metadata)),
     )
-    print(f"Saved {samples.shape[0]} samples to {output_path}")
+    print(f"Saved {samples.shape[0]} samples to {output_path} "
+          f"(effective rate {effective_rate:.1f} Hz)")
 
 
 async def stream_pieeg_data(
@@ -70,21 +79,25 @@ async def stream_pieeg_data(
     window_step = max(1, sample_rate // 10)
     rolling_buffer = np.zeros((N_CHANNELS, window_samples), dtype=np.float64)
     recorded_samples = []
+    sample_times = []
     window_count = 0
-    
+
     print(f"Connecting to PiEEG server at {server_url}...")
     try:
         async with websockets.connect(server_url) as ws:
             print(f"Connected. Recording label '{label}'. Press Ctrl+C to stop.")
             start_time = asyncio.get_running_loop().time()
-    
+
             async for raw_message in ws:
                 message = json.loads(raw_message)
-                channel_data = parse_channel_frame(message)
-                if channel_data is None:
+                parsed = parse_channel_frame(message)
+                if parsed is None:
                     continue
+                channel_data, sample_time = parsed
 
                 recorded_samples.append(channel_data)
+                if sample_time is not None:
+                    sample_times.append(float(sample_time))
                 rolling_buffer = np.roll(rolling_buffer, -1, axis=1)
                 rolling_buffer[:, -1] = channel_data
                 window_count += 1
@@ -102,6 +115,7 @@ async def stream_pieeg_data(
         if recorded_samples:
             save_recording(
                 np.asarray(recorded_samples),
+                np.asarray(sample_times) if sample_times else None,
                 output_path,
                 label,
                 brain_region,
